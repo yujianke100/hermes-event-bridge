@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 本地部署/配置（含敏感信息，勿提交）
+config.local.*
+.env
+*.pem
+*.key
+
+# 构建产物
+build/
+dist/
+
+# 系统
+.DS_Store
+Thumbs.db
