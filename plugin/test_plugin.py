@@ -2,7 +2,7 @@
 """插件自测：模拟 Hermes 的 ctx，调用 register()，触发各 hook，验证事件送达桥服务。
 
 用法:
-    python test_plugin.py [--bridge http://103.112.185.245:8788] [--token <t>]
+    python test_plugin.py [--bridge http://127.0.0.1:8788] [--token <t>]
 
 说明:
     register.py 的 hook 回调是 **kwargs 签名（Hermes 0.17.0 invoke_hook 以

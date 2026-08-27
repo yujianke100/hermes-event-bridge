@@ -7,7 +7,7 @@
     1. 环境变量  HERMES_BRIDGE_URL / HERMES_BRIDGE_TOKEN
     2. config.yaml 顶层 event_bridge 块:
          event_bridge:
-           url: http://103.112.185.245:8788
+           url: http://<你的桥服务器>:8788
            token: <你的token>
     3. 默认值 http://127.0.0.1:8788
 
