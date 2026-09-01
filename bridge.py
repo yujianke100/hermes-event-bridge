@@ -93,6 +93,7 @@ def list_events(since_ts: float = None, limit: int = 100, newest_first: bool = F
 # ---------------------------------------------------------------- 天气代理 (Open-Meteo)
 # 设备端无 TLS 能力 → 由桥代拉 HTTPS 天气，缓存后供设备 GET /weather 使用。
 import os
+import re
 import urllib.request
 import urllib.parse
 
@@ -248,6 +249,158 @@ def _fetch_weather(city):
         print(f"[weather] fetch {city} failed: {e}")
         return None
 
+# ================================================================
+# Hermes 事件智能 (方案A: 桥端是唯一智能点, 插件/webhook 只当导管)
+# ================================================================
+# 收到 Hermes 生命周期 hook → 翻译成设备可显示的通知事件。
+#
+# 关键语义 (Hermes 0.20.4):
+#   - on_session_end 是【turn 级】, 每轮都触发:
+#       completed=True / failed=False / interrupted=False  → 正常完成 → 立即通知
+#       interrupted=True (新任务打断旧 turn)                → 静默 (等新任务的完成)
+#       failed=True                                         → 立即通知(红色)
+#   - on_session_start / pre_llm_call: 会话标题 + 城市指令
+#   - pre_approval_request / post_approval_response: 授权黄/绿红
+#
+# 状态: 只保留「每个 session 的标题」, 不保留 idle 定时器 —
+#        「不需要 120 等待」= completed 立即通知, interrupted 静默。
+
+# 会话标题缓存: session_id -> 标题(用户首条消息前几个字)
+_session_titles: dict = {}
+_session_lock = threading.Lock()
+
+TITLE_MAX = 20  # 设备 toast 标题最多显示的字数
+
+
+def _remember_title(session_id: str, title: str):
+    with _session_lock:
+        _session_titles[session_id] = (title or "").strip()[:TITLE_MAX]
+
+
+def _get_title(session_id: str) -> str:
+    with _session_lock:
+        return _session_titles.get(session_id, "")
+
+
+def _city_set_intent(text: str):
+    """从用户消息提取设城市意图, 返回城市名或 None。"""
+    if not text:
+        return None
+    patterns = [
+        r"(?:把)?(?:天气)?城市(?:设为|改成|换为|改为|设置成|设成|变成)\s*([\u4e00-\u9fa5A-Za-z]{2,10})",
+        r"(?:天气)?换成\s*([\u4e00-\u9fa5A-Za-z]{2,10})(?:天气)?",
+        r"城市(?:设为|改成|换为|设置成|设成|改为)\s*([\u4e00-\u9fa5A-Za-z]{2,10})",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            city = m.group(1).strip()
+            if city in ("天气", "城市", "天气预报"):
+                return None
+            if city.endswith("天气"):
+                city = city[:-2].strip()
+            if not city:
+                return None
+            return city
+    return None
+
+
+def _set_weather_city(city: str):
+    """验证城市并持久化到 config.json。成功返回城市名, 失败返回 None。"""
+    geo = _geocode(city)
+    if not geo:
+        print(f"[hermes] city '{city}' not found")
+        return None
+    cfg = _load_config()
+    cfg["city"] = geo["city"]
+    _save_config(cfg)
+    print(f"[hermes] weather city set to {geo['city']}")
+    return geo["city"]
+
+
+def _handle_hermes_hook(hook_name: str, session_id: str, extra: dict):
+    """处理一个 Hermes outbound webhook 事件, 返回 (status_code, body)。"""
+    now = time.time()
+
+    if hook_name == "pre_llm_call":
+        # 第一轮: 记录标题 + 检测城市指令
+        user_msg = str(extra.get("user_message") or "").strip()
+        if extra.get("is_first_turn") and user_msg:
+            _remember_title(session_id, user_msg)
+            city = _city_set_intent(user_msg)
+            if city:
+                _set_weather_city(city)
+                push_event("session.end", status="completed",
+                           session_id=session_id,
+                           title=f"天气已设为{city}", subtitle="下次刷新天气生效",
+                           tone="1", duration_ms=3000)
+                return jsonify({"ok": True, "note": f"city->{city}"}), 200
+        return jsonify({"ok": True, "note": "title remembered"}), 200
+
+    if hook_name == "on_session_start":
+        push_event("session.start", session_id=session_id, title=_get_title(session_id),
+                   ts=now)
+        return jsonify({"ok": True, "note": "session.start"}), 200
+
+    if hook_name == "on_session_end":
+        completed = bool(extra.get("completed"))
+        failed = bool(extra.get("failed"))
+        interrupted = bool(extra.get("interrupted"))
+        reason = str(extra.get("turn_exit_reason") or "")
+
+        # 打断(新任务开始) → 静默
+        if interrupted or "interrupted" in reason:
+            print(f"[hermes] session {session_id} interrupted — silent")
+            return jsonify({"ok": True, "note": "interrupted-silent"}), 200
+
+        if failed:
+            ev = {
+                "status": "failed",
+                "title": _get_title(session_id) or "任务失败",
+                "subtitle": "会话执行出错",
+            }
+        elif completed or not reason:
+            ev = {
+                "status": "completed",
+                "title": _get_title(session_id) or "任务完成",
+                "subtitle": "会话已结束",
+            }
+        else:
+            ev = {
+                "status": "interrupted",
+                "title": _get_title(session_id) or "会话中断",
+                "subtitle": "任务被用户打断",
+            }
+        push_event("session.end", session_id=session_id, ts=now, tone="1",
+                   duration_ms=3000, **ev)
+        print(f"[hermes] session.end {ev['status']} title={ev['title']}")
+        return jsonify({"ok": True, "note": f"session.end-{ev['status']}"}), 200
+
+    if hook_name == "pre_approval_request":
+        command = str(extra.get("command") or "")[:60]
+        push_event("approval.requested", session_id=session_id, title="需要授权",
+                   subtitle=command or "Hermes 请求批准操作", ts=now, tone="1",
+                   duration_ms=3000)
+        print(f"[hermes] approval.requested cmd={command}")
+        return jsonify({"ok": True, "note": "approval.requested"}), 200
+
+    if hook_name == "post_approval_response":
+        choice = str(extra.get("choice") or "")
+        if choice in ("deny", "timeout"):
+            ev = {"status": "denied", "title": "授权被拒",
+                  "subtitle": "操作未获批准"}
+        else:
+            ev = {"status": "approved", "title": "授权通过",
+                  "subtitle": "操作已获批准"}
+        push_event("approval.decided", session_id=session_id, ts=now, tone="1",
+                   duration_ms=3000, **ev)
+        print(f"[hermes] approval.decided choice={choice}")
+        return jsonify({"ok": True, "note": "approval.decided"}), 200
+
+    # 其他 hook (观察用)
+    print(f"[hermes] hook {hook_name} (unhandled)")
+    return jsonify({"ok": True, "note": "unhandled"}), 200
+
 # ---------------------------------------------------------------- Flask app
 app = Flask(__name__)
 CORS(app)  # 允许开发板/浏览器跨域
@@ -284,10 +437,34 @@ def healthz():
 
 @app.route("/event", methods=["POST"])
 def receive_event():
-    """Hermes 插件 POST 事件到这里。支持 JSON 或表单。"""
+    """接收 Hermes 生命周期事件。支持两种来源:
+
+    1. 插件 (旧): {"event":"session.end", "status":..., "title":..., ...}
+    2. 原生 outbound webhook (新): {"hook_event_name":"on_session_end",
+       "session_id":"...", "extra":{...}, ...}
+
+    桥端是唯一智能点: 把 Hermes 的 turn 级事件翻译成设备通知。
+    - on_session_end: completed→立即通知; interrupted→静默(新任务打断);
+      failed→立即红 ×
+    - on_session_start → session.start (设备清除常驻 toast)
+    - pre_llm_call → 缓存会话标题 + 检测城市指令
+    - pre_approval_request → approval.requested (黄 !)
+    - post_approval_response → approval.decided (绿√/红×)
+    """
     if not _authed():
         return jsonify({"error": "unauthorized"}), 401
     data = request.get_json(silent=True) or {}
+
+    # ---- 原生 outbound webhook 格式 ----
+    hook_name = data.get("hook_event_name")
+    if hook_name:
+        sid = str(data.get("session_id") or "")
+        extra = data.get("extra") or {}
+        if not isinstance(extra, dict):
+            extra = {}
+        return _handle_hermes_hook(hook_name, sid, extra)
+
+    # ---- 旧插件格式 (保持兼容) ----
     ev_type = data.get("event") or data.get("type") or data.get("event_type")
     if not ev_type:
         return jsonify({"error": "missing 'event' field"}), 400
