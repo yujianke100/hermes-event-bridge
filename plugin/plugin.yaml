@@ -1,7 +1,7 @@
-# plugin.yaml — Hermes Event Bridge 通知插件
+# plugin.yaml — Hermes Event Bridge 导管插件
 name: hermes-event-bridge
-version: 1.2.0
-description: 将 Hermes session 完成 / 授权请求事件主动外发到事件桥服务，推送给 Arcs-Mini 等物联网设备；支持语音设置天气城市
+version: 1.3.0
+description: 将 Hermes 生命周期 hook 事件转发到事件桥服务（智能判定在桥端），推送给 Arcs-Mini 等物联网设备；支持语音设置天气城市
 author: yujianke100
 manifest_version: 2
 api_version: 1
@@ -22,24 +22,4 @@ config_schema:
     type: str
     default: ""
     description: "可选：事件桥鉴权 token（与 bridge.py --token 一致）"
-    required: false
-  notify_on:
-    type: list
-    default: ["session_end", "approval_request", "approval_response"]
-    description: "要外发的事件类型列表"
-    required: false
-  tone_enabled:
-    type: bool
-    default: true
-    description: "是否播放提示音（false = 纯屏幕显示，静音）"
-    required: false
-  duration_ms:
-    type: int
-    default: 3000
-    description: "通知显示时长(ms)；0=默认3000；-1=常驻直到 Hermes 开始下一轮对话才消失"
-    required: false
-  idle_seconds:
-    type: int
-    default: 120
-    description: "会话空闲多少秒后视为任务完成并外发通知（连续交互静默）"
     required: false
