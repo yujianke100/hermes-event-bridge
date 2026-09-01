@@ -79,6 +79,26 @@ def main():
         choice="approved", decided_by="user",
         session_key="sess-test-1", surface="cli",
     )
+    time.sleep(0.3)
+
+    # 变体事件：失败 / 中断 / 拒绝 —— 覆盖红×黄! 分支
+    ctx.hooks["on_session_end"](
+        session_id="sess-test-2", task_id="task-2", turn_id="turn-3",
+        completed=False, failed=True, interrupted=False,
+        turn_exit_reason="failed", model="deepseek-v4-flash", platform="cli",
+    )
+    time.sleep(0.3)
+    ctx.hooks["on_session_end"](
+        session_id="sess-test-3", task_id="task-3", turn_id="turn-4",
+        completed=False, failed=False, interrupted=True,
+        turn_exit_reason="interrupted", model="deepseek-v4-flash", platform="cli",
+    )
+    time.sleep(0.3)
+    ctx.hooks["post_approval_response"](
+        command="write_file", description="写入文件",
+        choice="denied", decided_by="user",
+        session_key="sess-test-3", surface="cli",
+    )
     time.sleep(0.5)
 
     after = fetch_events(bridge, since=since, token=token)
@@ -87,16 +107,25 @@ def main():
 
     events_by_kind = {e["event"]: e for e in after}
     assert "session.end" in events_by_kind, "session.end 未送达!"
-    assert events_by_kind["session.end"].get("status") == "completed", "status 错误"
     assert "approval.requested" in events_by_kind, "approval.requested 未送达!"
     assert events_by_kind["approval.requested"].get("description") == "需要授权写入文件", "授权描述错误"
     assert "approval.decided" in events_by_kind, "approval.decided 未送达!"
-    assert events_by_kind["approval.decided"].get("choice") == "approved", "授权结果错误"
 
-    print("\n✅ 插件自测通过: 3 类事件全部由插件 hook 正确外发到桥服务")
-    print("   - session.end         (status=completed)")
+    # 按 session_id 分组验证各变体
+    by_session = {}
+    for e in after:
+        sid = e.get("session_id") or e.get("session_key")
+        by_session.setdefault(sid, []).append(e)
+    assert any(e.get("status") == "completed" for e in by_session.get("sess-test-1", [])), "completed 缺失"
+    assert any(e.get("status") == "failed" for e in by_session.get("sess-test-2", [])), "failed 缺失"
+    assert any(e.get("status") == "interrupted" for e in by_session.get("sess-test-3", [])), "interrupted 缺失"
+    assert any(e.get("choice") == "approved" for e in by_session.get("sess-test-1", [])), "approved 缺失"
+    assert any(e.get("choice") == "denied" for e in by_session.get("sess-test-3", [])), "denied 缺失"
+
+    print("\n✅ 插件自测通过: 6 事件全部由插件 hook 正确外发到桥服务")
+    print("   - session.end         (status=completed + failed + interrupted)")
     print("   - approval.requested  (需要授权)")
-    print("   - approval.decided    (choice=approved)")
+    print("   - approval.decided    (choice=approved + denied)")
 
 
 if __name__ == "__main__":
