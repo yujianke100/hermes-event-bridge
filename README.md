@@ -6,15 +6,18 @@
 ```
 [任意 Hermes Studio]            [事件桥 bridge.py]                [小设备]
   ┌─────────────────┐   POST    ┌────────────────────┐  长轮询   ┌──────────────┐
-  │ 插件 (hooks)     │──/event──▶│ 事件队列 (内存)     │◀──/poll──▶│ Wi-Fi + 屏幕  │
-  │ on_session_end  │           │ TTL 12h, 上限2000  │           │ LED + 喇叭    │
-  │ approval.*      │           │ 可选 X-Bridge-Token│           │              │
+  │ 原生 outbound    │──/event──▶│ 事件队列 (内存)     │◀──/poll──▶│ Wi-Fi + 屏幕  │
+  │ webhook (config) │           │ TTL 12h, 上限2000  │           │ LED + 喇叭    │
+  │ hooks.outbound  │           │ 可选 X-Bridge-Token│           │ 时钟+天气     │
   └─────────────────┘           └────────────────────┘           └──────────────┘
 ```
 
-**核心设计**：Hermes 永远是**主动外发**的那一侧（插件 POST），
+**核心设计**：Hermes 永远是**主动外发**的那一侧（原生 outbound webhook，零代码、纯配置），
 设备/任何机器**主动连出**到桥服务。因此桥只要一台有公网 IP 的服务器即可，
 Hermes 跑在内网/远程机也毫无影响——不需要任何入站连到 Hermes 的端口。
+
+**ALL 智能都在桥端**：Hermes 只负责把生命周期 hook 原始 JSON 喷到桥，
+桥负责翻译成设备通知（会话标题、城市指令、"新任务打断旧任务不响"等）。
 
 ---
 
@@ -54,48 +57,58 @@ sudo systemctl daemon-reload && sudo systemctl enable --now hermes-event-bridge
 
 ---
 
-## 2. Hermes 插件
+## 2. Hermes 侧 — 原生 outbound webhook（零代码）
 
-目录：`plugin/`（plugin.yaml + register.py + __init__.py）。
-
-**安装**（Hermes 0.17.x+）：
-
-```bash
-# 把 plugin/ 目录复制到 Hermes 配置目录
-cp -r plugin "$HOME/AppData/Local/hermes/plugins/hermes-event-bridge"   # Windows
-# 启用
-hermes plugins enable hermes-event-bridge
-```
-
-**配置**：Hermes 的 `config.yaml` 顶层加：
+**不需要插件了**。Hermes 0.20.x 内置出站 webhook（`agent/outbound_webhooks.py`），
+启动时自动从 `config.yaml` 注册。只要在 Hermes 的 `~/.hermes/config.yaml` 顶部加：
 
 ```yaml
-event_bridge:
-  url: http://<你的服务器>:8788
-  token: <你的token>
+hooks:
+  outbound:
+    - url: http://<你的服务器>:8788/event
+      events:
+        - on_session_start
+        - on_session_end
+        - pre_llm_call
+        - pre_approval_request
+        - post_approval_response
+      timeout: 10
+      name: arcs-mini
 ```
 
-或用环境变量：`HERMES_BRIDGE_URL` / `HERMES_BRIDGE_TOKEN`。
+然后**重启 Hermes Studio / 网关**。`gateway/run.py` 启动时调用
+`register_outbound_webhooks()`，纯配置即生效。若你的 Hermes 里启用了旧的
+`hermes-event-bridge` 插件，记得禁用（`plugins.enabled: []`），避免双发。
 
-> 注意：Hermes 0.17.x 的 `PluginContext` **没有** `get_config()`（0.20.x 才有）。
-> 本插件用环境变量 + config.yaml 通用读取，两个版本都能跑；hook 回调是
-> **kwargs-only 签名**，与 0.17.0 的 `invoke_hook` 一致。
+**收到的事件 POST 格式**（`hook_event_name` + `session_id` + `extra`）：
 
-**外发的事件**：
+```json
+{
+  "hook_event_name": "on_session_end",
+  "session_id": "sess_abc123",
+  "cwd": "/home/user/project",
+  "extra": {"completed": true, "failed": false, "interrupted": false, "turn_exit_reason": "text_response(stop)"},
+  "delivery_id": "3f2c...",
+  "timestamp": "2026-09-01T12:00:00Z"
+}
+```
 
-| Hermes hook | 桥事件类型 | 触发时机 |
+可选 `secret_env`/`secret` 开启 HMAC-SHA256 签名（`X-Hermes-Signature-256`），
+防止伪造事件。
+
+**桥端智能判定**（`_handle_hermes_hook`）：
+
+| Hermes hook | 桥端行为 | 设备看到 |
 |---|---|---|
-| `on_session_end` | `session.end` | 会话每轮结束（含完成/失败/中断） |
-| `pre_approval_request` | `approval.requested` | 需要用户授权（危险命令等） |
-| `post_approval_response` | `approval.decided` | 用户做出授权决定 |
+| `pre_llm_call` (首轮) | 记住标题; 检测"把天气城市设为XX"→ 改城市 | 无（或完成通知"天气已设"） |
+| `on_session_start` | 转发 session.start | 清除常驻 toast |
+| `on_session_end` completed | **立即**通知（零延迟） | 绿 √ + 标题 |
+| `on_session_end` interrupted | **静默**（新任务打断旧 turn，不打扰） | 无 |
+| `on_session_end` failed | 立即通知 | 红 × |
+| `pre_approval_request` | 转发 | 黄 ! + 命令 |
+| `post_approval_response` | 转发 | 授权通过绿√ / 被拒红× |
 
-插件是 **observer 型**：网络失败只记日志，绝不阻塞/影响 Hermes 主流程。
-
-**离线自测**（不需要真实 Hermes）：
-
-```bash
-python plugin/test_plugin.py --bridge http://127.0.0.1:8788 --token <token>
-```
+> 旧版插件（`plugin/` 目录）保留作为参考/回退，但方案 A 之后不再需要。
 
 ---
 
